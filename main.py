@@ -10,7 +10,16 @@ import logging
 from dotenv import load_dotenv
 
 from database.db_handler import DatabaseHandler
-from states.registration import RegistrationStates, AdminStates
+from states.registration import RegistrationStates, AdminStates, AssignmentStates, SolutionStates, GradingStates
+from handlers.assignments import (
+    create_assignment_command, process_assignment_title, process_assignment_description,
+    process_assignment_grade, process_difficulty_choice, process_due_date,
+    show_all_assignments, show_my_assignments, show_assignment_detail,
+    start_solution_submission, process_solution_submission,
+    show_ungraded_solutions, view_solution_detail, start_grading,
+    process_grading_score, process_grading_comment, show_my_progress,
+    notify_students_new_assignment, notify_admin_new_solution, notify_student_grade
+)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -38,8 +47,11 @@ async def start_command(message: types.Message):
         await message.answer(
             "👨‍🏫 Добро пожаловать, администратор!\n\n"
             "Доступные команды:\n"
-            "/pending - посмотреть заявки на регистрацию\n"
+            "/pending - заявки на регистрацию\n"
             "/users - список учеников\n"
+            "/create_assignment - создать задание\n"
+            "/assignments - все задания\n"
+            "/ungraded - непроверенные решения\n"
             "/help - справка"
         )
     elif await db.is_user_registered(user_id):
@@ -47,6 +59,8 @@ async def start_command(message: types.Message):
         await message.answer(
             f"👋 Привет, {user_data['first_name']}!\n\n"
             "Вы уже зарегистрированы в системе.\n"
+            "/assignments - мои задания\n"
+            "/progress - моя статистика\n"
             "/profile - мой профиль\n"
             "/help - справка"
         )
@@ -327,6 +341,180 @@ async def show_users(message: types.Message):
         await message.answer(text)
 
 
+# === КОМАНДЫ ДЛЯ СИСТЕМЫ ЗАДАНИЙ ===
+
+# Команды для администратора
+@dp.message(Command("create_assignment"))
+async def create_assignment_handler(message: types.Message, state: FSMContext):
+    await create_assignment_command(message, state)
+
+
+@dp.message(StateFilter(AssignmentStates.waiting_for_title))
+async def assignment_title_handler(message: types.Message, state: FSMContext):
+    await process_assignment_title(message, state)
+
+
+@dp.message(StateFilter(AssignmentStates.waiting_for_description))
+async def assignment_description_handler(message: types.Message, state: FSMContext):
+    await process_assignment_description(message, state)
+
+
+@dp.message(StateFilter(AssignmentStates.waiting_for_grade))
+async def assignment_grade_handler(message: types.Message, state: FSMContext):
+    await process_assignment_grade(message, state)
+
+
+@dp.callback_query(F.data.startswith("difficulty_"))
+async def difficulty_handler(callback: CallbackQuery, state: FSMContext):
+    await process_difficulty_choice(callback, state)
+
+
+@dp.message(StateFilter(AssignmentStates.waiting_for_due_date))
+async def due_date_handler(message: types.Message, state: FSMContext):
+    # Получаем все данные и создаем задание
+    data = await state.get_data()
+    due_date = None
+
+    if message.text.lower() not in ['нет', 'no', 'skip', '-']:
+        try:
+            # Парсим дату
+            from datetime import datetime
+            date_str = message.text.strip()
+            due_date = datetime.strptime(date_str, "%d.%m.%Y").strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            await message.answer("❌ Неверный формат даты. Попробуйте ДД.ММ.ГГГГ или напишите 'нет':")
+            return
+
+    assignment_id = await db.create_assignment(
+        title=data['title'],
+        description=data['description'],
+        grade_level=data['grade_level'],
+        difficulty=data['difficulty'],
+        created_by=message.from_user.id,
+        due_date=due_date
+    )
+
+    grade_text = f"класс {data['grade_level']}" if data['grade_level'] > 0 else "все классы"
+    due_text = f"\n📅 Срок: {due_date[:10]}" if due_date else ""
+
+    await message.answer(
+        f"✅ Задание создано!\n\n"
+        f"📝 Название: {data['title']}\n"
+        f"🎓 Для: {grade_text}\n"
+        f"⚡ Сложность: {data['difficulty']}{due_text}\n\n"
+        f"ID задания: {assignment_id}"
+    )
+
+    # Уведомляем учеников о новом задании
+    notification_data = await notify_students_new_assignment(assignment_id, data)
+    if notification_data:
+        await send_assignment_notifications(notification_data)
+
+    await state.clear()
+
+
+@dp.message(Command("assignments"))
+async def assignments_handler(message: types.Message):
+    if await db.is_admin(message.from_user.id):
+        await show_all_assignments(message)
+    else:
+        await show_my_assignments(message)
+
+
+@dp.message(Command("assignment"))
+async def assignment_detail_handler(message: types.Message):
+    await show_assignment_detail(message)
+
+
+@dp.message(Command("ungraded"))
+async def ungraded_handler(message: types.Message):
+    await show_ungraded_solutions(message)
+
+
+# Команды для учеников
+@dp.message(Command("progress"))
+async def progress_handler(message: types.Message):
+    await show_my_progress(message)
+
+
+# Callback handlers для заданий
+@dp.callback_query(F.data.startswith("solve_"))
+async def solve_handler(callback: CallbackQuery, state: FSMContext):
+    await start_solution_submission(callback, state)
+
+
+@dp.message(StateFilter(SolutionStates.waiting_for_solution))
+async def solution_handler(message: types.Message, state: FSMContext):
+    if not message.text or len(message.text.strip()) < 10:
+        await message.answer("❌ Решение должно содержать минимум 10 символов:")
+        return
+
+    data = await state.get_data()
+    assignment_id = data['assignment_id']
+    user_id = message.from_user.id
+
+    result_id = await db.submit_solution(user_id, assignment_id, message.text.strip())
+    assignment = await db.get_assignment_by_id(assignment_id)
+
+    await message.answer(
+        f"✅ Решение отправлено!\n\n"
+        f"📝 Задание: {assignment['title']}\n"
+        f"🆔 ID решения: {result_id}\n\n"
+        "Ожидайте проверки преподавателем."
+    )
+
+    # Уведомляем админа о новом решении
+    notification_data = await notify_admin_new_solution(user_id, assignment_id, result_id)
+    if notification_data:
+        await send_solution_notification(notification_data)
+
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("view_solution_"))
+async def view_solution_handler(callback: CallbackQuery):
+    await view_solution_detail(callback)
+
+
+@dp.callback_query(F.data.startswith("grade_"))
+async def grade_handler(callback: CallbackQuery, state: FSMContext):
+    await start_grading(callback, state)
+
+
+@dp.message(StateFilter(GradingStates.waiting_for_score))
+async def grading_score_handler(message: types.Message, state: FSMContext):
+    await process_grading_score(message, state)
+
+
+@dp.message(StateFilter(GradingStates.waiting_for_comment))
+async def grading_comment_handler(message: types.Message, state: FSMContext):
+    comment = message.text.strip() if message.text.strip() != '-' else ""
+
+    data = await state.get_data()
+    solution_id = data['solution_id']
+    score = data['score']
+    max_score = data['max_score']
+
+    success = await db.grade_solution(solution_id, score, max_score, comment)
+
+    if success:
+        percentage = round((score / max_score) * 100, 1)
+        await message.answer(
+            f"✅ Оценка выставлена!\n\n"
+            f"📊 Результат: {score}/{max_score} ({percentage}%)\n"
+            f"💬 Комментарий: {comment if comment else 'Без комментария'}"
+        )
+
+        # Уведомляем ученика о результате
+        notification_data = await notify_student_grade(solution_id, score, max_score, comment)
+        if notification_data:
+            await send_grade_notification(notification_data)
+    else:
+        await message.answer("❌ Ошибка при выставлении оценки.")
+
+    await state.clear()
+
+
 @dp.message(Command("help"))
 async def help_command(message: types.Message):
     user_id = message.from_user.id
@@ -334,13 +522,21 @@ async def help_command(message: types.Message):
     if await db.is_admin(user_id):
         text = (
             "🔧 Команды администратора:\n\n"
+            "👥 Управление пользователями:\n"
             "/pending - заявки на регистрацию\n"
-            "/users - список учеников\n"
+            "/users - список учеников\n\n"
+            "📚 Управление заданиями:\n"
+            "/create_assignment - создать задание\n"
+            "/assignments - все задания\n"
+            "/ungraded - непроверенные решения\n\n"
             "/help - эта справка"
         )
     elif await db.is_user_registered(user_id):
         text = (
             "📚 Доступные команды:\n\n"
+            "/assignments - мои задания\n"
+            "/assignment <ID> - детали задания\n"
+            "/progress - моя статистика\n"
             "/profile - мой профиль\n"
             "/help - эта справка"
         )
@@ -356,6 +552,62 @@ async def help_command(message: types.Message):
 
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+async def send_assignment_notifications(notification_data):
+    """Отправить уведомления о новом задании"""
+    difficulty_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
+
+    for user in notification_data['target_users']:
+        try:
+            text = (
+                f"🆕 Новое задание!\n\n"
+                f"📝 {notification_data['title']}\n"
+                f"⚡ Сложность: {difficulty_emoji.get(notification_data['difficulty'], '⚡')} {notification_data['difficulty']}\n\n"
+                f"Посмотреть: /assignment {notification_data['assignment_id']}"
+            )
+            await bot.send_message(user['telegram_id'], text)
+        except Exception as e:
+            logging.error(f"Не удалось уведомить пользователя {user['telegram_id']}: {e}")
+
+
+async def send_solution_notification(notification_data):
+    """Отправить уведомление админу о новом решении"""
+    try:
+        text = (
+            f"📤 Новое решение!\n\n"
+            f"👤 {notification_data['user_data']['first_name']} {notification_data['user_data']['last_name']} "
+            f"({notification_data['user_data']['grade']} класс)\n"
+            f"📝 Задание: {notification_data['assignment']['title']}\n"
+            f"🆔 ID решения: {notification_data['result_id']}\n\n"
+            "Используйте /ungraded для проверки."
+        )
+
+        await bot.send_message(ADMIN_ID, text)
+    except Exception as e:
+        logging.error(f"Ошибка при уведомлении админа: {e}")
+
+
+async def send_grade_notification(notification_data):
+    """Отправить уведомление ученику об оценке"""
+    try:
+        grade_emoji = "🟢" if notification_data['percentage'] >= 80 else "🟡" if notification_data[
+                                                                                   'percentage'] >= 60 else "🔴"
+
+        text = (
+            f"{grade_emoji} Ваше решение проверено!\n\n"
+            f"📝 Задание: {notification_data['assignment_title']}\n"
+            f"📊 Оценка: {notification_data['score']}/{notification_data['max_score']} ({notification_data['percentage']}%)\n"
+        )
+
+        if notification_data['comment']:
+            text += f"💬 Комментарий: {notification_data['comment']}\n"
+
+        text += "\nПосмотреть все результаты: /progress"
+
+        await bot.send_message(notification_data['user_id'], text)
+    except Exception as e:
+        logging.error(f"Ошибка при уведомлении ученика: {e}")
+
 
 async def notify_admin_new_request(request_data):
     """Уведомляем администратора о новой заявке"""

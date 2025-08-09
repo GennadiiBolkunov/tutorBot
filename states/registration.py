@@ -11,3 +11,17 @@ class RegistrationStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_admin_decision = State()
     waiting_for_rejection_reason = State()
+
+class AssignmentStates(StatesGroup):
+    waiting_for_title = State()
+    waiting_for_description = State()
+    waiting_for_grade = State()
+    waiting_for_difficulty = State()
+    waiting_for_due_date = State()
+
+class SolutionStates(StatesGroup):
+    waiting_for_solution = State()
+
+class GradingStates(StatesGroup):
+    waiting_for_score = State()
+    waiting_for_comment = State()

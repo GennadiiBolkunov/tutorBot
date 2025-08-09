@@ -79,6 +79,7 @@ class DatabaseHandler:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     assignment_id INTEGER,
+                    solution_text TEXT,
                     score INTEGER,
                     max_score INTEGER,
                     completed_date DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -221,3 +222,164 @@ class DatabaseHandler:
             """)
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    # === МЕТОДЫ ДЛЯ ЗАДАНИЙ ===
+
+    async def create_assignment(self, title: str, description: str, grade_level: int,
+                                difficulty: str, created_by: int, due_date: str = None) -> int:
+        """Создать новое задание"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO assignments (title, description, grade_level, difficulty, created_by, due_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (title, description, grade_level, difficulty, created_by, due_date))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_assignments_for_grade(self, grade: int, is_active: bool = True) -> List[Dict]:
+        """Получить задания для определенного класса"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM assignments 
+                WHERE (grade_level = ? OR grade_level = 0) AND is_active = ?
+                ORDER BY created_date DESC
+            """, (grade, is_active))
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_assignment_by_id(self, assignment_id: int) -> Optional[Dict]:
+        """Получить задание по ID"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM assignments WHERE id = ?
+            """, (assignment_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_all_assignments(self) -> List[Dict]:
+        """Получить все задания (для админа)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT a.*, u.first_name as creator_name 
+                FROM assignments a
+                LEFT JOIN admins u ON a.created_by = u.telegram_id
+                ORDER BY a.created_date DESC
+            """)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def deactivate_assignment(self, assignment_id: int) -> bool:
+        """Деактивировать задание"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                UPDATE assignments SET is_active = FALSE WHERE id = ?
+            """, (assignment_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    # === МЕТОДЫ ДЛЯ РЕЗУЛЬТАТОВ ===
+
+    async def submit_solution(self, user_id: int, assignment_id: int, solution_text: str) -> int:
+        """Отправить решение задания"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Проверяем, не отправлял ли уже решение
+            cursor = await db.execute("""
+                SELECT id FROM results WHERE user_id = ? AND assignment_id = ?
+            """, (user_id, assignment_id))
+            existing = await cursor.fetchone()
+
+            if existing:
+                # Обновляем существующее решение
+                await db.execute("""
+                    UPDATE results SET solution_text = ?, completed_date = CURRENT_TIMESTAMP, score = NULL
+                    WHERE user_id = ? AND assignment_id = ?
+                """, (solution_text, user_id, assignment_id))
+                result_id = existing[0]
+            else:
+                # Создаем новое решение
+                cursor = await db.execute("""
+                    INSERT INTO results (user_id, assignment_id, solution_text)
+                    VALUES (?, ?, ?)
+                """, (user_id, assignment_id, solution_text))
+                result_id = cursor.lastrowid
+
+            await db.commit()
+            return result_id
+
+    async def get_user_solutions(self, user_id: int) -> List[Dict]:
+        """Получить все решения пользователя"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT r.*, a.title, a.description, a.difficulty
+                FROM results r
+                JOIN assignments a ON r.assignment_id = a.id
+                WHERE r.user_id = ?
+                ORDER BY r.completed_date DESC
+            """, (user_id,))
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_ungraded_solutions(self) -> List[Dict]:
+        """Получить непроверенные решения"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT r.*, a.title, a.grade_level, u.first_name, u.last_name
+                FROM results r
+                JOIN assignments a ON r.assignment_id = a.id
+                JOIN users u ON r.user_id = u.telegram_id
+                WHERE r.score IS NULL
+                ORDER BY r.completed_date ASC
+            """)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def grade_solution(self, result_id: int, score: int, max_score: int, comment: str = "") -> bool:
+        """Оценить решение"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                UPDATE results 
+                SET score = ?, max_score = ?, comment = ?
+                WHERE id = ?
+            """, (score, max_score, comment, result_id))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_user_stats(self, user_id: int) -> Dict:
+        """Получить статистику пользователя"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Общая статистика
+            cursor = await db.execute("""
+                SELECT 
+                    COUNT(*) as total_assignments,
+                    COUNT(CASE WHEN score IS NOT NULL THEN 1 END) as graded_assignments,
+                    AVG(CASE WHEN score IS NOT NULL AND max_score > 0 THEN (score * 100.0 / max_score) END) as avg_percentage
+                FROM results 
+                WHERE user_id = ?
+            """, (user_id,))
+            stats = await cursor.fetchone()
+
+            # Статистика по сложности
+            cursor = await db.execute("""
+                SELECT 
+                    a.difficulty,
+                    COUNT(*) as count,
+                    AVG(CASE WHEN r.score IS NOT NULL AND r.max_score > 0 THEN (r.score * 100.0 / r.max_score) END) as avg_percentage
+                FROM results r
+                JOIN assignments a ON r.assignment_id = a.id
+                WHERE r.user_id = ? AND r.score IS NOT NULL
+                GROUP BY a.difficulty
+            """, (user_id,))
+            difficulty_stats = await cursor.fetchall()
+
+            return {
+                'total_assignments': stats[0] if stats else 0,
+                'graded_assignments': stats[1] if stats else 0,
+                'avg_percentage': round(stats[2], 1) if stats and stats[2] else 0,
+                'difficulty_stats': {row[0]: {'count': row[1], 'avg_percentage': round(row[2], 1) if row[2] else 0}
+                                     for row in difficulty_stats}
+            }

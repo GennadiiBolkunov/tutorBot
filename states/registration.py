@@ -25,3 +25,9 @@ class SolutionStates(StatesGroup):
 class GradingStates(StatesGroup):
     waiting_for_score = State()
     waiting_for_comment = State()
+
+class FileStates(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_assignment_files = State()
+    waiting_for_solution_files = State()
+    waiting_for_grade_files = State()

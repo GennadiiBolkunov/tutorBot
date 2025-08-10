@@ -89,7 +89,96 @@ class DatabaseHandler:
                 )
             """)
 
+            # НОВАЯ ТАБЛИЦА ДЛЯ ФАЙЛОВ
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id TEXT NOT NULL,  -- Telegram file_id
+                    file_unique_id TEXT,    -- Telegram unique_id
+                    file_name TEXT,         -- Имя файла
+                    file_size INTEGER,      -- Размер файла
+                    mime_type TEXT,         -- MIME-тип
+                    file_type TEXT NOT NULL, -- 'photo', 'document', 'video'
+                    uploaded_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    uploaded_by INTEGER NOT NULL,
+                    description TEXT,       -- Описание файла
+                    FOREIGN KEY (uploaded_by) REFERENCES users (telegram_id)
+                )
+            """)
+
+            # НОВАЯ ТАБЛИЦА ДЛЯ СВЯЗИ ФАЙЛОВ С ОБЪЕКТАМИ
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS file_attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_id INTEGER NOT NULL,
+                    object_type TEXT NOT NULL, -- 'assignment', 'solution', 'grade'
+                    object_id INTEGER NOT NULL, -- ID задания, решения или оценки
+                    attached_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (file_id) REFERENCES files (id)
+                )
+            """)
+
             await db.commit()
+
+    # === МЕТОДЫ ДЛЯ РАБОТЫ С ФАЙЛАМИ ===
+
+    async def save_file(self, file_id: str, file_unique_id: str, file_name: str,
+                       file_size: int, mime_type: str, file_type: str,
+                       uploaded_by: int, description: str = "") -> int:
+        """Сохранить информацию о файле"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO files (file_id, file_unique_id, file_name, file_size, 
+                                 mime_type, file_type, uploaded_by, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (file_id, file_unique_id, file_name, file_size, mime_type,
+                  file_type, uploaded_by, description))
+            await db.commit()
+            return cursor.lastrowid
+
+    async def attach_file_to_object(self, file_id: int, object_type: str, object_id: int):
+        """Привязать файл к объекту (заданию, решению, оценке)"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO file_attachments (file_id, object_type, object_id)
+                VALUES (?, ?, ?)
+            """, (file_id, object_type, object_id))
+            await db.commit()
+
+    async def get_object_files(self, object_type: str, object_id: int) -> List[Dict]:
+        """Получить все файлы, привязанные к объекту"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT f.*, fa.attached_date, u.first_name, u.last_name
+                FROM files f
+                JOIN file_attachments fa ON f.id = fa.file_id
+                LEFT JOIN users u ON f.uploaded_by = u.telegram_id
+                WHERE fa.object_type = ? AND fa.object_id = ?
+                ORDER BY fa.attached_date ASC
+            """, (object_type, object_id))
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_file_by_id(self, file_id: int) -> Optional[Dict]:
+        """Получить информацию о файле по ID"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT * FROM files WHERE id = ?
+            """, (file_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def delete_file_attachment(self, file_id: int, object_type: str, object_id: int) -> bool:
+        """Удалить привязку файла к объекту"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                DELETE FROM file_attachments 
+                WHERE file_id = ? AND object_type = ? AND object_id = ?
+            """, (file_id, object_type, object_id))
+            await db.commit()
+            return cursor.rowcount > 0
 
     # === МЕТОДЫ ДЛЯ ЗАЯВОК НА РЕГИСТРАЦИЮ ===
 

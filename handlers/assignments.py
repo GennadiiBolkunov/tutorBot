@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 import aiosqlite
 
 from database.db_handler import DatabaseHandler
-from states.registration import AssignmentStates, SolutionStates, GradingStates
+from states.registration import AssignmentStates, SolutionStates, GradingStates, FileStates
+from utils.file_utils import FileProcessor
 
 db = DatabaseHandler()
 
@@ -101,26 +102,110 @@ async def process_due_date(message: types.Message, state: FSMContext):
             await message.answer("❌ Неверный формат даты. Попробуйте ДД.ММ.ГГГГ или напишите 'нет':")
             return
 
-    # Получаем все данные и создаем задание
+    await state.update_data(due_date=due_date)
+
+    # НОВОЕ: Предлагаем добавить файлы
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📎 Добавить файлы", callback_data="add_assignment_files"),
+            InlineKeyboardButton(text="✅ Создать без файлов", callback_data="create_assignment_without_files")
+        ]
+    ])
+
+    await message.answer(
+        "📎 Хотите прикрепить файлы к заданию?\n"
+        "(PDF, DOC, изображения и т.д.)",
+        reply_markup=keyboard
+    )
+
+
+async def handle_add_assignment_files(callback: CallbackQuery, state: FSMContext):
+    """Обработка добавления файлов к заданию"""
+    await state.update_data(assignment_files=[])  # Инициализируем список файлов
+
+    await callback.message.edit_text(
+        "📎 Отправьте файлы для задания\n\n"
+        "Поддерживаются:\n"
+        "• PDF (до 20 МБ)\n"
+        "• DOC/DOCX (до 10 МБ)\n"
+        "• Изображения JPG/PNG (до 5 МБ)\n"
+        "• TXT (до 1 МБ)\n\n"
+        "Отправьте файлы по одному или группой.\n"
+        "Когда закончите, нажмите /done"
+    )
+    await state.set_state(FileStates.waiting_for_assignment_files)
+
+
+async def handle_create_assignment_without_files(callback: CallbackQuery, state: FSMContext):
+    """Создать задание без файлов"""
+    await create_assignment_final(callback.message, state, [])
+
+
+async def process_assignment_files(message: types.Message, state: FSMContext):
+    """Обработка файлов для задания"""
+    if message.text == "/done":
+        # Завершаем добавление файлов
+        data = await state.get_data()
+        assignment_files = data.get('assignment_files', [])
+        await create_assignment_final(message, state, assignment_files)
+        return
+
+    # Обрабатываем файлы
+    files_data = await FileProcessor.process_message_files(message)
+
+    if not files_data:
+        await message.answer(
+            "❌ Не удалось обработать файлы.\n"
+            "Проверьте тип и размер файлов.\n\n"
+            "Отправьте другой файл или нажмите /done для завершения."
+        )
+        return
+
+    # Добавляем файлы к списку
+    data = await state.get_data()
+    assignment_files = data.get('assignment_files', [])
+    assignment_files.extend(files_data)
+    await state.update_data(assignment_files=assignment_files)
+
+    # Подтверждаем получение
+    files_text = "\n".join([f"✅ {f['file_name']}" for f in files_data])
+    total_files = len(assignment_files)
+
+    await message.answer(
+        f"✅ Файлы добавлены:\n{files_text}\n\n"
+        f"Всего файлов: {total_files}\n"
+        "Отправьте еще файлы или нажмите /done для завершения."
+    )
+
+
+async def create_assignment_final(message: types.Message, state: FSMContext, files_data: list):
+    """Финальное создание задания с файлами"""
     data = await state.get_data()
 
+    # Создаем задание
     assignment_id = await db.create_assignment(
         title=data['title'],
         description=data['description'],
         grade_level=data['grade_level'],
         difficulty=data['difficulty'],
         created_by=message.from_user.id,
-        due_date=due_date
+        due_date=data.get('due_date')
     )
 
+    # Привязываем файлы к заданию
+    if files_data:
+        file_db_ids = [f['db_id'] for f in files_data]
+        await FileProcessor.attach_files_to_object(file_db_ids, 'assignment', assignment_id)
+
     grade_text = f"класс {data['grade_level']}" if data['grade_level'] > 0 else "все классы"
-    due_text = f"\n📅 Срок: {due_date[:10]}" if due_date else ""
+    due_text = f"\n📅 Срок: {data['due_date'][:10]}" if data.get('due_date') else ""
+    files_text = f"\n📎 Файлов: {len(files_data)}" if files_data else ""
 
     await message.answer(
         f"✅ Задание создано!\n\n"
         f"📝 Название: {data['title']}\n"
         f"🎓 Для: {grade_text}\n"
-        f"⚡ Сложность: {data['difficulty']}{due_text}\n\n"
+        f"⚡ Сложность: {data['difficulty']}{due_text}{files_text}\n\n"
         f"ID задания: {assignment_id}"
     )
 
@@ -129,8 +214,7 @@ async def process_due_date(message: types.Message, state: FSMContext):
     notification_data = await notify_students_new_assignment(assignment_id, data)
 
     await state.clear()
-
-    return notification_data  # Возвращаем для обработки в main
+    return notification_data
 
 
 async def show_all_assignments(message: types.Message):
@@ -151,9 +235,13 @@ async def show_all_assignments(message: types.Message):
         grade_text = f"класс {assignment['grade_level']}" if assignment['grade_level'] > 0 else "все классы"
         due_text = f" (до {assignment['due_date'][:10]})" if assignment['due_date'] else ""
 
+        # Получаем количество файлов
+        files = await db.get_object_files('assignment', assignment['id'])
+        files_text = f" 📎{len(files)}" if files else ""
+
         text += (
             f"🆔 {assignment['id']} - {assignment['title']}\n"
-            f"🎓 {grade_text} | ⚡ {assignment['difficulty']} | {status}{due_text}\n"
+            f"🎓 {grade_text} | ⚡ {assignment['difficulty']} | {status}{due_text}{files_text}\n"
             f"📅 {assignment['created_date'][:10]}\n\n"
         )
 
@@ -188,9 +276,13 @@ async def show_my_assignments(message: types.Message):
         due_text = f" 📅 до {assignment['due_date'][:10]}" if assignment['due_date'] else ""
         difficulty_emoji = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
 
+        # Получаем количество файлов
+        files = await db.get_object_files('assignment', assignment['id'])
+        files_text = f" 📎{len(files)}" if files else ""
+
         text += (
             f"🆔 {assignment['id']} - {assignment['title']}\n"
-            f"{difficulty_emoji.get(assignment['difficulty'], '⚡')} {assignment['difficulty']}{due_text}\n"
+            f"{difficulty_emoji.get(assignment['difficulty'], '⚡')} {assignment['difficulty']}{due_text}{files_text}\n"
             f"📄 {assignment['description'][:100]}{'...' if len(assignment['description']) > 100 else ''}\n\n"
         )
 
@@ -244,6 +336,17 @@ async def show_assignment_detail(message: types.Message):
         f"📅 Создано: {assignment['created_date'][:16]}{due_text}"
     )
 
+    # Показываем файлы задания
+    files = await db.get_object_files('assignment', assignment_id)
+    if files:
+        text += f"\n\n{FileProcessor.format_file_list(files)}"
+
+    await message.answer(text)
+
+    # Отправляем файлы, если есть
+    if files:
+        await send_files_to_user(message, files, "Файлы задания:")
+
     # Добавляем кнопки для действий
     if await db.is_admin(user_id):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -255,7 +358,7 @@ async def show_assignment_detail(message: types.Message):
             [InlineKeyboardButton(text="📤 Отправить решение", callback_data=f"solve_{assignment_id}")]
         ])
 
-    await message.answer(text, reply_markup=keyboard)
+    await message.answer("Действия:", reply_markup=keyboard)
 
 
 async def start_solution_submission(callback: CallbackQuery, state: FSMContext):
@@ -272,7 +375,7 @@ async def start_solution_submission(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Задание не найдено.")
         return
 
-    await state.update_data(assignment_id=assignment_id)
+    await state.update_data(assignment_id=assignment_id, solution_files=[])
     await callback.message.edit_text(
         f"📝 Отправка решения для: {assignment['title']}\n\n"
         "Отправьте ваше решение текстом. Можете включить:\n"
@@ -294,13 +397,94 @@ async def process_solution_submission(message: types.Message, state: FSMContext)
     assignment_id = data['assignment_id']
     user_id = message.from_user.id
 
-    result_id = await db.submit_solution(user_id, assignment_id, message.text.strip())
+    await state.update_data(solution_text=message.text.strip())
+
+    # НОВОЕ: Предлагаем добавить файлы к решению
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📎 Добавить файлы", callback_data="add_solution_files"),
+            InlineKeyboardButton(text="✅ Отправить без файлов", callback_data="submit_solution_without_files")
+        ]
+    ])
+
+    await message.answer(
+        "📎 Хотите прикрепить файлы к решению?\n"
+        "(сканы, фото решения, дополнительные материалы)",
+        reply_markup=keyboard
+    )
+
+
+async def handle_add_solution_files(callback: CallbackQuery, state: FSMContext):
+    """Обработка добавления файлов к решению"""
+    await callback.message.edit_text(
+        "📎 Отправьте файлы к решению\n\n"
+        "Отправьте файлы по одному или группой.\n"
+        "Когда закончите, нажмите /done"
+    )
+    await state.set_state(FileStates.waiting_for_solution_files)
+
+
+async def handle_submit_solution_without_files(callback: CallbackQuery, state: FSMContext):
+    """Отправить решение без файлов"""
+    await submit_solution_final(callback.message, state, [])
+
+
+async def process_solution_files(message: types.Message, state: FSMContext):
+    """Обработка файлов для решения"""
+    if message.text == "/done":
+        # Завершаем добавление файлов
+        data = await state.get_data()
+        solution_files = data.get('solution_files', [])
+        await submit_solution_final(message, state, solution_files)
+        return
+
+    # Обрабатываем файлы
+    files_data = await FileProcessor.process_message_files(message)
+
+    if not files_data:
+        await message.answer(
+            "❌ Не удалось обработать файлы.\n"
+            "Отправьте другой файл или нажмите /done для завершения."
+        )
+        return
+
+    # Добавляем файлы к списку
+    data = await state.get_data()
+    solution_files = data.get('solution_files', [])
+    solution_files.extend(files_data)
+    await state.update_data(solution_files=solution_files)
+
+    # Подтверждаем получение
+    files_text = "\n".join([f"✅ {f['file_name']}" for f in files_data])
+    total_files = len(solution_files)
+
+    await message.answer(
+        f"✅ Файлы добавлены:\n{files_text}\n\n"
+        f"Всего файлов: {total_files}\n"
+        "Отправьте еще файлы или нажмите /done для завершения."
+    )
+
+
+async def submit_solution_final(message: types.Message, state: FSMContext, files_data: list):
+    """Финальная отправка решения с файлами"""
+    data = await state.get_data()
+    assignment_id = data['assignment_id']
+    user_id = message.from_user.id
+
+    result_id = await db.submit_solution(user_id, assignment_id, data['solution_text'])
+
+    # Привязываем файлы к решению
+    if files_data:
+        file_db_ids = [f['db_id'] for f in files_data]
+        await FileProcessor.attach_files_to_object(file_db_ids, 'solution', result_id)
+
     assignment = await db.get_assignment_by_id(assignment_id)
+    files_text = f"\n📎 Файлов: {len(files_data)}" if files_data else ""
 
     await message.answer(
         f"✅ Решение отправлено!\n\n"
         f"📝 Задание: {assignment['title']}\n"
-        f"🆔 ID решения: {result_id}\n\n"
+        f"🆔 ID решения: {result_id}{files_text}\n\n"
         "Ожидайте проверки преподавателем."
     )
 
@@ -309,8 +493,7 @@ async def process_solution_submission(message: types.Message, state: FSMContext)
     notification_data = await notify_admin_new_solution(user_id, assignment_id, result_id)
 
     await state.clear()
-
-    return notification_data  # Возвращаем для обработки в main
+    return notification_data
 
 
 # === СИСТЕМА ОЦЕНИВАНИЯ ===
@@ -328,6 +511,10 @@ async def show_ungraded_solutions(message: types.Message):
         return
 
     for solution in solutions[:5]:  # Показываем по 5 за раз
+        # Получаем количество файлов решения
+        files = await db.get_object_files('solution', solution['id'])
+        files_text = f" 📎{len(files)}" if files else ""
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Оценить", callback_data=f"grade_{solution['id']}"),
@@ -338,7 +525,7 @@ async def show_ungraded_solutions(message: types.Message):
         text = (
             f"📝 {solution['title']}\n"
             f"👤 {solution['first_name']} {solution['last_name']} ({solution['grade_level']} класс)\n"
-            f"📅 Отправлено: {solution['completed_date'][:16]}\n"
+            f"📅 Отправлено: {solution['completed_date'][:16]}{files_text}\n"
             f"🆔 ID: {solution['id']}"
         )
 
@@ -366,18 +553,27 @@ async def view_solution_detail(callback: CallbackQuery):
         f"📅 {solution['completed_date'][:16]}"
     )
 
+    # Показываем файлы решения
+    files = await db.get_object_files('solution', solution_id)
+    if files:
+        text += f"\n\n{FileProcessor.format_file_list(files)}"
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Оценить", callback_data=f"grade_{solution['id']}")]
     ])
 
     await callback.message.edit_text(text, reply_markup=keyboard)
 
+    # Отправляем файлы, если есть
+    if files:
+        await send_files_to_user(callback.message, files, "Файлы решения:")
+
 
 async def start_grading(callback: CallbackQuery, state: FSMContext):
     """Начать оценивание решения"""
     solution_id = int(callback.data.split("_")[1])
 
-    await state.update_data(solution_id=solution_id)
+    await state.update_data(solution_id=solution_id, grade_files=[])
     await callback.message.edit_text(
         "📊 Оценивание решения\n\n"
         "Введите оценку в формате: <балл>/<максимум>\n"
@@ -412,30 +608,108 @@ async def process_grading_comment(message: types.Message, state: FSMContext):
     """Обработка комментария к оценке"""
     comment = message.text.strip() if message.text.strip() != '-' else ""
 
+    await state.update_data(comment=comment)
+
+    # НОВОЕ: Предлагаем добавить файлы к оценке
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📎 Добавить файлы", callback_data="add_grade_files"),
+            InlineKeyboardButton(text="✅ Завершить без файлов", callback_data="submit_grade_without_files")
+        ]
+    ])
+
+    await message.answer(
+        "📎 Хотите прикрепить файлы к оценке?\n"
+        "(исправления, разбор ошибок, дополнительные материалы)",
+        reply_markup=keyboard
+    )
+
+
+async def handle_add_grade_files(callback: CallbackQuery, state: FSMContext):
+    """Обработка добавления файлов к оценке"""
+    await callback.message.edit_text(
+        "📎 Отправьте файлы к оценке\n\n"
+        "Отправьте файлы по одному или группой.\n"
+        "Когда закончите, нажмите /done"
+    )
+    await state.set_state(FileStates.waiting_for_grade_files)
+
+
+async def handle_submit_grade_without_files(callback: CallbackQuery, state: FSMContext):
+    """Выставить оценку без файлов"""
+    await submit_grade_final(callback.message, state, [])
+
+
+async def process_grade_files(message: types.Message, state: FSMContext):
+    """Обработка файлов для оценки"""
+    if message.text == "/done":
+        # Завершаем добавление файлов
+        data = await state.get_data()
+        grade_files = data.get('grade_files', [])
+        await submit_grade_final(message, state, grade_files)
+        return
+
+    # Обрабатываем файлы
+    files_data = await FileProcessor.process_message_files(message)
+
+    if not files_data:
+        await message.answer(
+            "❌ Не удалось обработать файлы.\n"
+            "Отправьте другой файл или нажмите /done для завершения."
+        )
+        return
+
+    # Добавляем файлы к списку
+    data = await state.get_data()
+    grade_files = data.get('grade_files', [])
+    grade_files.extend(files_data)
+    await state.update_data(grade_files=grade_files)
+
+    # Подтверждаем получение
+    files_text = "\n".join([f"✅ {f['file_name']}" for f in files_data])
+    total_files = len(grade_files)
+
+    await message.answer(
+        f"✅ Файлы добавлены:\n{files_text}\n\n"
+        f"Всего файлов: {total_files}\n"
+        "Отправьте еще файлы или нажмите /done для завершения."
+    )
+
+
+async def submit_grade_final(message: types.Message, state: FSMContext, files_data: list):
+    """Финальное выставление оценки с файлами"""
     data = await state.get_data()
     solution_id = data['solution_id']
     score = data['score']
     max_score = data['max_score']
+    comment = data['comment']
 
     success = await db.grade_solution(solution_id, score, max_score, comment)
 
     if success:
+        # Привязываем файлы к оценке
+        if files_data:
+            file_db_ids = [f['db_id'] for f in files_data]
+            await FileProcessor.attach_files_to_object(file_db_ids, 'grade', solution_id)
+
         percentage = round((score / max_score) * 100, 1)
+        files_text = f"\n📎 Файлов: {len(files_data)}" if files_data else ""
+
         await message.answer(
             f"✅ Оценка выставлена!\n\n"
             f"📊 Результат: {score}/{max_score} ({percentage}%)\n"
-            f"💬 Комментарий: {comment if comment else 'Без комментария'}"
+            f"💬 Комментарий: {comment if comment else 'Без комментария'}{files_text}"
         )
 
         # Уведомляем ученика о результате
         from handlers.assignments import notify_student_grade
         notification_data = await notify_student_grade(solution_id, score, max_score, comment)
 
+        await state.clear()
         return notification_data  # Возвращаем для обработки в main
     else:
         await message.answer("❌ Ошибка при выставлении оценки.")
-
-    await state.clear()
+        await state.clear()
 
 
 # === СТАТИСТИКА ДЛЯ УЧЕНИКОВ ===
@@ -472,11 +746,21 @@ async def show_my_progress(message: types.Message):
             text += f"{name}: {data['avg_percentage']}% ({data['count']} заданий)\n"
         text += "\n"
 
-    # Последние решения
+    # Последние решения с информацией о файлах
     text += "📋 Последние решения:\n"
     for solution in solutions[:5]:
         status = "⏳ На проверке" if solution['score'] is None else f"✅ {solution['score']}/{solution['max_score']}"
-        text += f"• {solution['title']} - {status}\n"
+
+        # Получаем количество файлов решения и оценки
+        solution_files = await db.get_object_files('solution', solution['id'])
+        grade_files = await db.get_object_files('grade', solution['id'])
+        files_info = ""
+        if solution_files:
+            files_info += f" 📎{len(solution_files)}"
+        if grade_files and solution['score'] is not None:
+            files_info += f" 📋{len(grade_files)}"
+
+        text += f"• {solution['title']} - {status}{files_info}\n"
 
     if len(solutions) > 5:
         text += f"\nИ еще {len(solutions) - 5} решений..."
@@ -484,7 +768,79 @@ async def show_my_progress(message: types.Message):
     await message.answer(text)
 
 
+async def show_solution_details(message: types.Message):
+    """Показать детали конкретного решения"""
+    user_id = message.from_user.id
+
+    if not await db.is_user_registered(user_id):
+        await message.answer("❌ Вы не зарегистрированы в системе.")
+        return
+
+    try:
+        # Извлекаем ID решения из команды
+        solution_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.answer("❌ Используйте: /solution <ID решения>")
+        return
+
+    # Получаем решения пользователя
+    solutions = await db.get_user_solutions(user_id)
+    solution = next((s for s in solutions if s['id'] == solution_id), None)
+
+    if not solution:
+        await message.answer("❌ Решение не найдено или не принадлежит вам.")
+        return
+
+    status = "⏳ На проверке" if solution[
+                                    'score'] is None else f"✅ {solution['score']}/{solution['max_score']} ({round((solution['score'] / solution['max_score']) * 100, 1)}%)"
+
+    text = (
+        f"📝 {solution['title']}\n\n"
+        f"📊 Статус: {status}\n"
+        f"📅 Отправлено: {solution['completed_date'][:16]}\n\n"
+        f"📄 Ваше решение:\n{solution['solution_text']}"
+    )
+
+    if solution['comment'] and solution['score'] is not None:
+        text += f"\n\n💬 Комментарий преподавателя:\n{solution['comment']}"
+
+    await message.answer(text)
+
+    # Показываем файлы решения
+    solution_files = await db.get_object_files('solution', solution_id)
+    if solution_files:
+        await message.answer(f"📎 Ваши файлы к решению:")
+        await send_files_to_user(message, solution_files, "")
+
+    # Показываем файлы оценки (если есть)
+    if solution['score'] is not None:
+        grade_files = await db.get_object_files('grade', solution_id)
+        if grade_files:
+            await message.answer(f"📋 Файлы от преподавателя:")
+            await send_files_to_user(message, grade_files, "")
+
+
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
+async def send_files_to_user(message: types.Message, files: list, caption: str = ""):
+    """Отправить файлы пользователю"""
+    try:
+        for file_info in files:
+            file_caption = f"{caption}\n📄 {file_info['file_name']}" if caption else file_info['file_name']
+
+            if file_info['file_type'] == 'photo':
+                await message.answer_photo(
+                    photo=file_info['file_id'],
+                    caption=file_caption[:1024]  # Ограничение Telegram
+                )
+            else:
+                await message.answer_document(
+                    document=file_info['file_id'],
+                    caption=file_caption[:1024]  # Ограничение Telegram
+                )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке файлов: {str(e)}")
+
 
 async def notify_students_new_assignment(assignment_id: int, assignment_data: dict):
     """Уведомить учеников о новом задании"""
@@ -503,7 +859,8 @@ async def notify_students_new_assignment(assignment_id: int, assignment_data: di
             'assignment_id': assignment_id,
             'title': assignment_data['title'],
             'difficulty': assignment_data['difficulty'],
-            'target_users': target_users
+            'target_users': target_users,
+            'has_files': len(assignment_data.get('assignment_files', [])) > 0
         }
 
         # Возвращаем данные для уведомления, которые обработает основной код
@@ -520,10 +877,15 @@ async def notify_admin_new_solution(user_id: int, assignment_id: int, result_id:
         user_data = await db.get_user(user_id)
         assignment = await db.get_assignment_by_id(assignment_id)
 
+        # Получаем количество файлов в решении
+        solution_files = await db.get_object_files('solution', result_id)
+
         return {
             'user_data': user_data,
             'assignment': assignment,
-            'result_id': result_id
+            'result_id': result_id,
+            'has_files': len(solution_files) > 0,
+            'files_count': len(solution_files)
         }
     except Exception as e:
         print(f"Ошибка при подготовке уведомления админа: {e}")
@@ -547,13 +909,18 @@ async def notify_student_grade(solution_id: int, score: int, max_score: int, com
             user_id, assignment_title = result
             percentage = round((score / max_score) * 100, 1)
 
+            # Получаем количество файлов в оценке
+            grade_files = await db.get_object_files('grade', solution_id)
+
             return {
                 'user_id': user_id,
                 'assignment_title': assignment_title,
                 'score': score,
                 'max_score': max_score,
                 'percentage': percentage,
-                'comment': comment
+                'comment': comment,
+                'has_files': len(grade_files) > 0,
+                'files_count': len(grade_files)
             }
 
     except Exception as e:
